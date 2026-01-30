@@ -1691,6 +1691,10 @@ pull_images() {
     fi
 
     # Pull with docker compose (more reliable, handles auth, shows progress)
+    # Use --ignore-buildable to skip services with build: directives, and
+    # don't fail the entire deploy if individual images can't be pulled
+    # (e.g., platform mismatch — the user may have locally-built replacements).
+    local pull_exit=0
     if [ "$USE_TUI" = true ] && command -v gum &> /dev/null && [ -t 0 ]; then
         # Use compose pull without -q to show progress, gum will capture it
         $compose_cmd -f docker-compose.yml -f docker-compose.prod.yml pull 2>&1 | while read -r line; do
@@ -1699,8 +1703,42 @@ pull_images() {
                 echo "  $line"
             fi
         done
+        pull_exit=${PIPESTATUS[0]}
     else
-        $compose_cmd -f docker-compose.yml -f docker-compose.prod.yml pull
+        $compose_cmd -f docker-compose.yml -f docker-compose.prod.yml pull || pull_exit=$?
+    fi
+
+    if [ "$pull_exit" -ne 0 ]; then
+        tui_warn "Some images failed to pull (exit $pull_exit). Continuing with locally available images."
+    fi
+
+    # Warn if any pulled images don't match the host architecture (QEMU emulation)
+    local host_arch
+    host_arch=$(docker info --format '{{.Architecture}}' 2>/dev/null || uname -m)
+    # Normalize: x86_64 -> amd64, aarch64 -> arm64
+    case "$host_arch" in
+        x86_64) host_arch="amd64" ;;
+        aarch64) host_arch="arm64" ;;
+    esac
+
+    local mismatched=""
+    if [ -n "$images" ]; then
+        while read -r img; do
+            local img_arch
+            img_arch=$(docker inspect --format '{{.Architecture}}' "$img" 2>/dev/null) || continue
+            if [ -n "$img_arch" ] && [ "$img_arch" != "$host_arch" ]; then
+                local name
+                name=$(echo "$img" | sed 's/.*\///' | cut -d: -f1)
+                mismatched="${mismatched}  - ${name} (image: ${img_arch}, host: ${host_arch})\n"
+            fi
+        done <<< "$images"
+    fi
+
+    if [ -n "$mismatched" ]; then
+        echo ""
+        tui_warn "Platform mismatch detected — these images may run under QEMU emulation:"
+        echo -e "$mismatched"
+        tui_info "To fix: rebuild these images for ${host_arch}, or wait for multi-arch manifest updates."
     fi
 }
 
